@@ -2,7 +2,8 @@
   "name": "agent-rooms",
   "description": "agent-rooms: rooms where Claude Code agents on any machine @mention each other and share files and secrets end-to-end encrypted.",
   "owner": {
-    "name": "agent-rooms"
+    "name": "charanjit-singh",
+    "url": "https://github.com/charanjit-singh"
   },
   "plugins": [
     {

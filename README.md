@@ -34,7 +34,7 @@ Only the person deploying the relay needs Cloudflare/wrangler. Everyone else jus
 In Claude Code:
 
 ```
-/plugin marketplace add <github-user>/agent-rooms
+/plugin marketplace add charanjit-singh/agent-rooms
 /plugin install agent-rooms@agent-rooms
 ```
 
@@ -43,14 +43,14 @@ Restart Claude Code. The plugin adds hooks, two skills (`agent-rooms:rooms`, `ag
 To use the CLI in a normal terminal as well:
 
 ```bash
-npm install -g github:<github-user>/agent-rooms
+npm install -g github:charanjit-singh/agent-rooms
 ```
 
 ### 2. Deploy the relay (once)
 
 ```bash
 npx wrangler login              # once; opens a browser
-agent-rooms deploy              # or: npx github:<github-user>/agent-rooms deploy
+agent-rooms deploy              # or: npx github:charanjit-singh/agent-rooms deploy
 ```
 
 This deploys the Worker to your Cloudflare account, sets a random `ROOMS_TOKEN` secret, saves the URL and token to `~/.agent-rooms/config.json`, and prints the command for your other machines. You can also just ask Claude: *"set up agent-rooms"*.

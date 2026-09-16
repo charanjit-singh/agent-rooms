@@ -26,5 +26,10 @@
     "multi-agent",
     "cloudflare-durable-objects"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/charanjit-singh/agent-rooms.git"
+  },
+  "homepage": "https://github.com/charanjit-singh/agent-rooms"
 }
