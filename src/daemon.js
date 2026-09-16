@@ -1,8 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
-import { profileFor, receiveAttachment } from "./agent.js";
-import { RoomConnection } from "./client.js";
-import { loadConfig } from "./config.js";
+import { connectionFor, profileFor, receiveAttachment } from "./agent.js";
+import { getServer } from "./config.js";
 import { entryKey, pidAlive, Session } from "./store.js";
 
 const TICK_MS = 2000;
@@ -16,20 +15,24 @@ export async function runDaemon(sessionKey) {
   fs.rmSync(session.file("stop"), { force: true });
 
   const log = (line) => session.log("daemon.log", line);
-  let config = loadConfig();
-  const connections = new Map();
+  const connections = new Map(); // "server/room" -> RoomConnection
+  const problems = new Map(); // "server/room" -> reason it isn't connected
   const seen = new Set(session.readInbox().map(entryKey));
   log(`daemon started for session ${session.key} (project ${meta.project})`);
 
   const writeStatus = () => {
     const rooms = {};
-    for (const [room, c] of connections) {
-      rooms[room] = { handle: c.welcome?.you?.handle || null, connected: c.connected, error: c.connected ? null : c.lastError };
+    for (const key of Object.keys(session.rooms)) {
+      const c = connections.get(key);
+      rooms[key] = c
+        ? { handle: c.welcome?.you?.handle || null, connected: c.connected, error: c.connected ? null : c.lastError }
+        : { handle: null, connected: false, error: problems.get(key) || "not connected" };
     }
     session.writeStatus({ pid: process.pid, rooms });
   };
 
-  const deliver = async (conn, m) => {
+  const deliver = (serverName) => async (conn, m) => {
+    m.server = serverName;
     const key = entryKey(m);
     if (seen.has(key)) return;
     if (m.attachment) {
@@ -47,18 +50,21 @@ export async function runDaemon(sessionKey) {
     log(`stored ${key} from @${m.from} (${m.kind})`);
   };
 
-  const onState = (conn) => {
+  const onState = (key) => (conn) => {
     const handle = conn.welcome?.you?.handle;
-    if (conn.connected && handle && session.rooms[conn.room] && session.rooms[conn.room].handle !== handle) {
-      session.updateRoom(conn.room, { handle });
-    }
+    const entry = session.rooms[key];
+    if (conn.connected && handle && entry && entry.handle !== handle) session.updateRoom(key, { handle });
     writeStatus();
+  };
+
+  const stopConn = (key) => {
+    connections.get(key)?.stop();
+    connections.delete(key);
   };
 
   const shutdown = (reason) => {
     log(`daemon stopping: ${reason}`);
-    for (const c of connections.values()) c.stop();
-    connections.clear();
+    for (const key of [...connections.keys()]) stopConn(key);
     writeStatus();
     fs.rmSync(session.file("daemon.pid"), { force: true });
     process.exit(0);
@@ -70,31 +76,36 @@ export async function runDaemon(sessionKey) {
     if (fs.existsSync(session.file("stop"))) return shutdown("stop requested");
     if (meta.claudePid && !pidAlive(meta.claudePid)) return shutdown("claude process exited");
     if (session.readPid("daemon.pid") !== process.pid) return shutdown("replaced by another daemon");
-    if (!config.url) config = loadConfig();
-    if (!config.url) return;
 
     const wanted = session.rooms;
-    for (const [room, c] of connections) {
-      if (!wanted[room]) {
-        c.stop();
-        connections.delete(room);
-        log(`left ${room}`);
+    for (const key of [...connections.keys()]) {
+      if (!wanted[key]) {
+        stopConn(key);
+        log(`left ${key}`);
       }
     }
-    for (const room of Object.keys(wanted)) {
-      if (connections.has(room)) continue;
-      const conn = new RoomConnection({
-        url: config.url,
-        token: config.token,
-        room,
-        agentId: session.key,
-        profile: profileFor(session, room),
-        onDeliver: deliver,
-        onState,
+    for (const [key, entry] of Object.entries(wanted)) {
+      const server = getServer(entry.server);
+      const existing = connections.get(key);
+      if (!server) {
+        if (existing) stopConn(key);
+        problems.set(key, `server "${entry.server}" is not configured on this machine`);
+        continue;
+      }
+      problems.delete(key);
+      // Server URL or token edited under us: reconnect with the new settings.
+      if (existing && (existing.url !== server.url || existing.token !== server.token)) {
+        stopConn(key);
+        log(`server ${server.name} changed, reconnecting ${key}`);
+      }
+      if (connections.has(key)) continue;
+      const conn = connectionFor({ server, room: entry.room, key }, session, profileFor(session, key), {
+        onDeliver: deliver(server.name),
+        onState: onState(key),
         log,
       }).start();
-      connections.set(room, conn);
-      log(`connecting to ${room}`);
+      connections.set(key, conn);
+      log(`connecting to ${key}`);
     }
     writeStatus();
   };

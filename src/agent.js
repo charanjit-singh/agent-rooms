@@ -2,65 +2,47 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CHUNK_BYTES, mentionsIn, ROOM_RE, RoomConnection } from "./client.js";
-import { homeDir, loadConfig, loadProjectConfig, writePrivate } from "./config.js";
+import { CHUNK_BYTES, mentionsIn, RoomConnection } from "./client.js";
+import { homeDir, loadProjectConfig, parseRoomRef, writePrivate } from "./config.js";
 import { loadIdentity, openSealed, sealForRecipients } from "./crypto.js";
 
 export const safeName = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/, "_").slice(0, 120) || "file";
 
-export function normalizeRoom(room) {
-  const r = String(room || "").toLowerCase();
-  if (!ROOM_RE.test(r)) throw new Error(`invalid room "${room}": use a-z 0-9 . _ - (max 64, start alphanumeric)`);
-  return r;
-}
-
-export function requireConfig() {
-  const config = loadConfig();
-  if (!config.url) {
-    throw new Error(
-      "agent-rooms is not configured.\n  Deploy your own worker:   agent-rooms deploy   (needs Node 22+ and a Cloudflare account; uses wrangler)\n  Or join an existing one:  agent-rooms setup --url <worker-url> --token <token>"
-    );
-  }
-  return config;
-}
-
-export function profileFor(session, room, overrides = {}) {
+export function profileFor(session, key, overrides = {}) {
   const meta = session.meta || {};
   const projectDir = meta.project || process.cwd();
   const project = loadProjectConfig(projectDir);
   const rooms = session.rooms;
-  const saved = rooms[room] || {};
+  const saved = rooms[key] || {};
   const host = os.hostname().split(".")[0];
   const fallbackHandle = meta.human ? os.userInfo().username : `${path.basename(projectDir)}-${host}`;
   // An agent keeps one identity: reuse the handle it already has in other rooms.
   const handleElsewhere = Object.values(rooms).find((r) => r.handle)?.handle;
+  const introElsewhere = Object.values(rooms).find((r) => r.intro)?.intro;
   return {
     handle: overrides.handle || saved.handle || handleElsewhere || project.handle || fallbackHandle,
-    intro: overrides.intro || saved.intro || project.intro || "",
+    intro: overrides.intro || saved.intro || introElsewhere || project.intro || "",
     machine: host,
     project: path.basename(projectDir),
     publicKey: loadIdentity().publicKey,
   };
 }
 
-// One-shot, passive connection for CLI commands.
-export async function openRoom(session, room, overrides = {}) {
-  const config = requireConfig();
-  const conn = new RoomConnection({
-    url: config.url,
-    token: config.token,
-    room,
-    agentId: session.key,
-    profile: profileFor(session, room, overrides),
-    passive: true,
-    reconnect: false,
-  }).start();
+export function connectionFor({ server, room, key }, session, profile, extra = {}) {
+  return new RoomConnection({ url: server.url, token: server.token, room, agentId: session.key, profile, ...extra });
+}
+
+// One-shot, passive connection for CLI commands. `ref` is "[server/]room".
+export async function openRoom(session, ref, overrides = {}) {
+  const target = typeof ref === "string" ? parseRoomRef(ref) : ref;
+  const conn = connectionFor(target, session, profileFor(session, target.key, overrides), { passive: true, reconnect: false }).start();
+  conn.target = target;
   let timer;
   try {
     await Promise.race([
       conn.ready,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`timed out connecting to room "${room}"`)), 20_000);
+        timer = setTimeout(() => reject(new Error(`timed out connecting to ${target.key}`)), 20_000);
       }),
     ]);
   } catch (e) {
@@ -85,12 +67,12 @@ export async function receiveAttachment(conn, m, projectDir) {
 
   if (a.secret) {
     const { value } = JSON.parse(plaintext.toString("utf8"));
-    const file = path.join(homeDir(), "secrets", safeName(m.room), safeName(a.name));
+    const file = path.join(homeDir(), "secrets", safeName(m.server), safeName(m.room), safeName(a.name));
     writePrivate(file, value);
     return file;
   }
   const roomsDir = path.join(projectDir, ".claude", "rooms");
-  const file = path.join(roomsDir, safeName(m.room), "files", `${m.seq}-${safeName(a.name)}`);
+  const file = path.join(roomsDir, safeName(m.server), safeName(m.room), "files", `${m.seq}-${safeName(a.name)}`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const ignore = path.join(roomsDir, ".gitignore");
   if (!fs.existsSync(ignore)) fs.writeFileSync(ignore, "*\n");

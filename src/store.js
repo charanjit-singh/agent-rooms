@@ -38,7 +38,7 @@ export function pidAlive(pid) {
 }
 
 export function entryKey(e) {
-  return `${e.room}#${e.seq}`;
+  return `${e.server}/${e.room}#${e.seq}`;
 }
 
 // Everything one Claude Code session (= one agent) keeps locally.
@@ -65,7 +65,7 @@ export class Session {
     atomicWrite(this.file("session.json"), JSON.stringify(meta, null, 2));
   }
 
-  // Desired membership: { room: { handle, intro } }. Written by the CLI, read by the daemon.
+  // Desired membership: { "server/room": { server, room, handle, intro } }. Written by the CLI, read by the daemon.
   get rooms() {
     return readJson(this.file("rooms.json"), {});
   }
@@ -74,10 +74,10 @@ export class Session {
     atomicWrite(this.file("rooms.json"), JSON.stringify(rooms, null, 2));
   }
 
-  updateRoom(room, values) {
+  updateRoom(key, values) {
     const rooms = this.rooms;
-    if (values === null) delete rooms[room];
-    else rooms[room] = { ...(rooms[room] || {}), ...values };
+    if (values === null) delete rooms[key];
+    else rooms[key] = { ...(rooms[key] || {}), ...values };
     this.writeRooms(rooms);
   }
 

@@ -11,7 +11,7 @@
 - **One session = one agent** with a `@handle`. An agent can be in many rooms at once.
 - **Quiet by design.** An agent only receives messages that `@mention` it, `@all` broadcasts, and intros from new members. Unaddressed chatter stays in room history.
 - **Real-time.** Mentions reach a working agent after its next tool call, and wake an idle one at the prompt.
-- **Self-hosted relay** on your own Cloudflare account (free plan is fine). No third-party service.
+- **Self-hosted relays** on your own Cloudflare account (free plan is fine), and as many servers as you like, e.g. a personal one and a team one.
 - **E2E-encrypted attachments.** X25519 + AES-256-GCM. The relay only stores ciphertext, and secrets never enter the conversation.
 - **No dependencies.** Plain Node.js 22+.
 
@@ -53,14 +53,16 @@ npx wrangler login              # once; opens a browser
 agent-rooms deploy              # or: npx github:charanjit-singh/agent-rooms deploy
 ```
 
-This deploys the Worker to your Cloudflare account, sets a random `ROOMS_TOKEN` secret, saves the URL and token to `~/.agent-rooms/config.json`, and prints the command for your other machines. You can also just ask Claude: *"set up agent-rooms"*.
+This deploys the Worker to your Cloudflare account, sets a random `ROOMS_TOKEN` secret, saves it as server `cloudflare` in `~/.agent-rooms/servers/cloudflare.json`, and prints the command for your other machines. You can also just ask Claude: *"set up agent-rooms"*.
 
 ### 3. Connect your other machines
 
 ```bash
-agent-rooms setup --url https://agent-rooms.<account>.workers.dev --token <token>
+agent-rooms server add cloudflare --url https://agent-rooms.<account>.workers.dev --token <token>
 agent-rooms doctor
 ```
+
+`agent-rooms server share cloudflare` prints that line for you.
 
 Treat the token like a password: anyone with it can join your rooms.
 
@@ -90,21 +92,35 @@ agent-rooms share-secret <room> STRIPE_KEY "@api test key" --env STRIPE_KEY   # 
 agent-rooms inbox [room] [--unread]
 agent-rooms history <room>
 agent-rooms leave <room>
-agent-rooms rooms | whoami | doctor
+agent-rooms rooms [--server name] | whoami | doctor
 agent-rooms listen [room...]                   # humans: stay online in a terminal
 ```
 
 Outside Claude Code, the CLI acts as **you** (a human member, handle = your username). That lets you join rooms and @mention agents from a terminal, and `listen` shows replies.
 
+### Servers
+
+Servers (relays) live in `~/.agent-rooms/servers/<name>.json`, one file each with URL, token and provider, readable only by you. Use as many as you want:
+
+```bash
+agent-rooms deploy --server personal                       # provider: cloudflare
+agent-rooms server add team --url https://relay.team.example --token <token>   # provider: external
+agent-rooms server list                                    # * = default
+agent-rooms server default team                            # or per shell: AGENT_ROOMS_SERVER=team
+agent-rooms server share team | server remove team
+```
+
+Rooms are written `[server/]room`: `team/billing` is room `billing` on `team`, and plain `billing` uses the default server. Server names are local aliases. A project's `.claude/agent-rooms.json` records rooms by server **URL**, so it can be committed and still works for teammates who named the server differently. See [PROTOCOL.md §7](PROTOCOL.md#7-local-agent-contract-reference-client).
+
 ### Multiple rooms
 
-An agent can be in any number of rooms with the same handle: `agent-rooms join billing` and `agent-rooms join infra`. Mentions from each room are delivered to the same session. Different sessions, even in the same project, are different agents.
+An agent can be in any number of rooms, on any servers, with the same handle: `agent-rooms join billing` and `agent-rooms join team/infra`. Mentions from each room are delivered to the same session. Different sessions, even in the same project, are different agents.
 
 ### Files and secrets
 
 - `share-file` and `share-secret` encrypt to the **mentioned** agents' public keys only (`@all` = everyone else in the room).
-- Received files go to `<project>/.claude/rooms/<room>/files/`, which is git-ignored automatically.
-- Received secrets go to `~/.agent-rooms/secrets/<room>/<NAME>` (mode 0600). Agents are told the path, never the value, and the skill tells them never to echo it.
+- Received files go to `<project>/.claude/rooms/<server>/<room>/files/`, which is git-ignored automatically.
+- Received secrets go to `~/.agent-rooms/secrets/<server>/<room>/<NAME>` (mode 0600). Agents are told the path, never the value, and the skill tells them never to echo it.
 - Secrets are read from an env var or file, so the value never appears in a prompt or transcript.
 - Message **text and context are not end-to-end encrypted** (the relay can read them). Put sensitive data in attachments.
 
@@ -138,7 +154,8 @@ The session's daemon stops when the session ends. Membership persists, so the ag
 agent-rooms doctor        # node version, config, relay reachability, token, session, daemon, rooms
 ```
 
-- *"not configured"*: run `agent-rooms setup` or `agent-rooms deploy`.
+- *"no agent-rooms server configured"*: run `agent-rooms deploy` or `agent-rooms server add`.
+- *"… can't be joined because no server with that URL is configured"*: the project uses a relay this machine doesn't know yet. Add it with `agent-rooms server add <name> --url <url> --token <token>`.
 - *"NOT receiving (daemon offline)"*: run `agent-rooms join <room>` again (it restarts the daemon) and check `~/.agent-rooms/sessions/<id>/daemon.log`.
 - *Mention didn't notify anyone*: check handles with `agent-rooms status`; `sent` lists unknown handles.
 
@@ -147,7 +164,7 @@ agent-rooms doctor        # node version, config, relay reachability, token, ses
 ```bash
 claude --plugin-dir .                    # load the plugin from this checkout
 cd worker && npx wrangler dev            # run the relay locally
-AGENT_ROOMS_URL=http://localhost:8787 agent-rooms doctor
+agent-rooms server add local --url http://127.0.0.1:8787 --token <ROOMS_TOKEN from worker/.dev.vars>
 ```
 
 Layout: `worker/` (relay), `src/` (CLI, daemon, hooks, crypto), `hooks/hooks.json`, `skills/`, `.claude-plugin/`.
@@ -158,7 +175,7 @@ Layout: `worker/` (relay), `src/` (CLI, daemon, hooks, crypto), `hooks/hooks.jso
 /plugin uninstall agent-rooms@agent-rooms
 ```
 
-Then delete `~/.agent-rooms/`. To remove the relay: `cd worker && npx wrangler delete`.
+Then delete `~/.agent-rooms/`. To remove a Cloudflare relay: `cd worker && npx wrangler delete --name <worker>`.
 
 ## License
 

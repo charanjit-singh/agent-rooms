@@ -5,9 +5,21 @@ import path from "node:path";
 import process from "node:process";
 import readline from "node:readline/promises";
 import { fileURLToPath } from "node:url";
-import { normalizeRoom, openRoom, profileFor, receiveAttachment, requireConfig, shareAttachment } from "./agent.js";
-import { MAX_FILE_BYTES, RoomConnection } from "./client.js";
-import { loadConfig, loadProjectConfig, saveConfig, saveProjectConfig } from "./config.js";
+import { connectionFor, openRoom, profileFor, receiveAttachment, shareAttachment } from "./agent.js";
+import { MAX_FILE_BYTES } from "./client.js";
+import {
+  defaultServerName,
+  forgetProjectRoom,
+  getServer,
+  listServers,
+  NOT_CONFIGURED,
+  parseRoomRef,
+  rememberProjectRoom,
+  removeServer,
+  saveServer,
+  setDefaultServer,
+  validateServerName,
+} from "./config.js";
 import { fingerprint, loadIdentity } from "./crypto.js";
 import { runDaemon } from "./daemon.js";
 import { formatEntry } from "./format.js";
@@ -16,16 +28,19 @@ import { entryKey, humanSession, resolveSession } from "./store.js";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const VERSION = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")).version;
-const BOOLEAN_FLAGS = new Set(["help", "version", "unread", "keep", "no-remember", "rotate-token", "yes"]);
+const BOOLEAN_FLAGS = new Set(["help", "version", "unread", "keep", "no-remember", "rotate-token", "default"]);
 
 const HELP = `agent-rooms ${VERSION}: rooms where Claude Code agents @mention each other
 
-Setup
-  agent-rooms deploy [--name agent-rooms]      Deploy the relay worker to your Cloudflare account (wrangler)
-  agent-rooms setup --url <url> --token <tok>  Connect this machine to an existing worker
-  agent-rooms doctor                           Check config, connectivity, session and daemon
+Servers (relays; stored in ~/.agent-rooms/servers/)
+  agent-rooms deploy [--server cloudflare] [--worker agent-rooms] [--rotate-token] [--default]
+                                               Deploy a relay to your Cloudflare account (wrangler)
+  agent-rooms server add <name> --url <url> --token <token> [--default]
+  agent-rooms server list | remove <name> | default <name>
+  agent-rooms server share <name>              Print the command other machines run to add it
+  agent-rooms doctor                           Check servers, session and daemon
 
-Rooms (run by an agent inside Claude Code, or by you in a terminal)
+Rooms are written [server/]room; a bare room uses the default server.
   agent-rooms join <room> [--intro "..."] [--handle name] [--no-remember]
   agent-rooms leave <room> [--keep]
   agent-rooms status [room]                    Members, who is online, your @handle
@@ -34,7 +49,7 @@ Rooms (run by an agent inside Claude Code, or by you in a terminal)
   agent-rooms share-secret <room> <name> <message> (--env VAR | --file path)
   agent-rooms inbox [room] [--limit N] [--unread]
   agent-rooms history <room> [--limit N]
-  agent-rooms rooms                            All rooms on the worker
+  agent-rooms rooms [--server name]            Rooms that exist on a server
   agent-rooms whoami
   agent-rooms listen [room...]                 Stay online in a terminal and print what arrives (humans)
 
@@ -89,8 +104,8 @@ function memberLine(m, me) {
   return `  @${m.handle}${m.agentId === me ? " (you)" : ""}  ${state}  ${m.machine}/${m.project}${m.intro ? `\n      ${m.intro}` : ""}`;
 }
 
-async function withRoom(session, room, fn, overrides) {
-  const conn = await openRoom(session, room, overrides);
+async function withRoom(session, target, fn, overrides) {
+  const conn = await openRoom(session, target, overrides);
   try {
     return await fn(conn);
   } finally {
@@ -98,38 +113,102 @@ async function withRoom(session, room, fn, overrides) {
   }
 }
 
-function requireJoined(session, room) {
-  if (!session.rooms[room]) throw new Error(`not in room "${room}"; run: agent-rooms join ${room} --intro "..."`);
+// Resolve a room the session has joined. Accepts "server/room" or a bare room
+// name, which also matches a joined room on a non-default server if unambiguous.
+function joinedTarget(session, ref) {
+  const rooms = session.rooms;
+  const raw = String(ref || "").toLowerCase();
+  if (!raw.includes("/")) {
+    const matches = Object.keys(rooms).filter((k) => rooms[k].room === raw);
+    if (matches.length === 1) return parseRoomRef(matches[0]);
+    if (matches.length > 1) throw new Error(`"${raw}" is joined on several servers: use one of ${matches.join(", ")}`);
+  }
+  const target = parseRoomRef(ref);
+  if (!rooms[target.key]) throw new Error(`not in room ${target.key}; run: agent-rooms join ${target.key} --intro "..."`);
+  return target;
+}
+
+function authHeaders(server) {
+  return server.token ? { Authorization: `Bearer ${server.token}` } : {};
 }
 
 function run(cmd, args, opts = {}) {
   return spawnSync(cmd, args, { shell: process.platform === "win32", encoding: "utf8", ...opts });
 }
 
-const commands = {
-  async setup({ flags }) {
+async function checkServer(url, token) {
+  const res = await fetch(`${url}/rooms`, { headers: token ? { Authorization: `Bearer ${token}` } : {} }).catch((e) => {
+    throw new Error(`cannot reach ${url}: ${e.message}`);
+  });
+  if (res.status === 401) throw new Error(`${url} rejected that token`);
+  if (!res.ok) throw new Error(`unexpected response from ${url}: HTTP ${res.status}`);
+}
+
+const serverCommands = {
+  async add({ positional, flags }) {
+    const name = validateServerName(need(positional[0], "server add <name> --url <url> --token <token>"));
     let { url, token } = flags;
     if ((!url || !token) && process.stdin.isTTY) {
       const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      url ||= (await rl.question("Worker URL (https://agent-rooms.<you>.workers.dev): ")).trim();
-      token ||= (await rl.question("Room token: ")).trim();
+      if (typeof url !== "string") url = (await rl.question("Relay URL (https://agent-rooms.<account>.workers.dev): ")).trim();
+      if (typeof token !== "string") token = (await rl.question("Token: ")).trim();
       rl.close();
     }
-    need(url, "setup --url <worker-url> --token <token>");
-    url = String(url).replace(/\/$/, "");
-    const res = await fetch(`${url}/rooms`, { headers: token ? { Authorization: `Bearer ${token}` } : {} }).catch((e) => {
-      throw new Error(`cannot reach ${url}: ${e.message}`);
-    });
-    if (res.status === 401) throw new Error("the worker rejected that token");
-    if (!res.ok) throw new Error(`unexpected response from ${url}: HTTP ${res.status}`);
-    const saved = saveConfig({ url, token: token || "" });
-    console.log(`Saved to ${saved.file}. This machine can now join rooms on ${url}.`);
+    url = String(need(url, "server add <name> --url <url> --token <token>")).replace(/\/+$/, "");
+    token = typeof token === "string" ? token : "";
+    await checkServer(url, token);
+    const existing = getServer(name);
+    const saved = saveServer({ name, url, token, provider: typeof flags.provider === "string" ? flags.provider : existing?.provider || "external" });
+    if (flags.default) setDefaultServer(name);
+    console.log(`${existing ? "Updated" : "Added"} server "${saved.name}" → ${saved.url}${defaultServerName() === name ? " (default)" : ""}.`);
+  },
+
+  async list() {
+    const servers = listServers();
+    if (!servers.length) return console.log(NOT_CONFIGURED);
+    const def = defaultServerName();
+    for (const s of servers) {
+      console.log(`${s.name === def ? "*" : " "} ${s.name.padEnd(16)} ${String(s.provider || "external").padEnd(11)} ${s.url}${s.token ? "" : "  (no token)"}`);
+    }
+  },
+
+  async remove({ positional }) {
+    const name = validateServerName(need(positional[0], "server remove <name>"));
+    if (!getServer(name)) throw new Error(`unknown server "${name}"`);
+    removeServer(name);
+    console.log(`Removed server "${name}". Rooms on it stop receiving in new and running sessions.`);
+  },
+
+  async default({ positional }) {
+    const name = validateServerName(need(positional[0], "server default <name>"));
+    if (!getServer(name)) throw new Error(`unknown server "${name}"`);
+    setDefaultServer(name);
+    console.log(`Default server is now "${name}".`);
+  },
+
+  async share({ positional }) {
+    const name = validateServerName(need(positional[0], "server share <name>"));
+    const s = getServer(name);
+    if (!s) throw new Error(`unknown server "${name}"`);
+    console.log(`Run this on the other machine (contains the token, so share it privately):\n\n  agent-rooms server add ${s.name} --url ${s.url} --token ${s.token}`);
+  },
+};
+
+const commands = {
+  async server({ positional, flags }) {
+    const [sub, ...rest] = positional;
+    const handler = serverCommands[sub || "list"];
+    if (!handler) throw new Error(`unknown subcommand "server ${sub}" (add, list, remove, default, share)`);
+    return handler({ positional: rest, flags });
   },
 
   async deploy({ flags }) {
     const workerDir = path.join(ROOT, "worker");
     if (!fs.existsSync(path.join(workerDir, "wrangler.toml"))) throw new Error(`worker sources not found at ${workerDir}`);
-    const nameArgs = flags.name ? ["--name", String(flags.name)] : [];
+    const name = validateServerName(typeof flags.server === "string" ? flags.server : "cloudflare");
+    const existing = getServer(name);
+    const worker = typeof flags.worker === "string" ? flags.worker : existing?.cloudflare?.worker || "agent-rooms";
+    const workerArgs = ["--name", worker];
 
     console.log("Checking Cloudflare login (wrangler whoami)…");
     const who = run("npx", ["--yes", "wrangler", "whoami"], { cwd: workerDir });
@@ -139,62 +218,67 @@ const commands = {
       run("npx", ["--yes", "wrangler", "login"], { cwd: workerDir, stdio: "inherit" });
     }
 
-    console.log("Deploying worker…");
-    const dep = run("npx", ["--yes", "wrangler", "deploy", ...nameArgs], { cwd: workerDir });
+    console.log(`Deploying worker "${worker}"…`);
+    const dep = run("npx", ["--yes", "wrangler", "deploy", ...workerArgs], { cwd: workerDir });
     process.stderr.write(dep.stdout || "");
     process.stderr.write(dep.stderr || "");
     if (dep.status !== 0) throw new Error("wrangler deploy failed (output above)");
     const url = (`${dep.stdout}`.match(/https:\/\/[^\s]+\.workers\.dev/) || [])[0];
-    if (!url) throw new Error("deployed, but couldn't find the workers.dev URL in wrangler's output; run agent-rooms setup manually");
+    if (!url) throw new Error("deployed, but couldn't find the workers.dev URL in wrangler's output; add it with agent-rooms server add");
 
-    const existing = loadConfig();
-    const token = flags.token || (existing.url === url && existing.token && !flags["rotate-token"] ? existing.token : crypto.randomBytes(24).toString("hex"));
+    const reuse = existing && existing.url === url && existing.token && !flags["rotate-token"];
+    const token = typeof flags.token === "string" ? flags.token : reuse ? existing.token : crypto.randomBytes(24).toString("hex");
     console.log("Setting ROOMS_TOKEN secret…");
-    const sec = run("npx", ["--yes", "wrangler", "secret", "put", "ROOMS_TOKEN", ...nameArgs], { cwd: workerDir, input: `${token}\n` });
+    const sec = run("npx", ["--yes", "wrangler", "secret", "put", "ROOMS_TOKEN", ...workerArgs], { cwd: workerDir, input: `${token}\n` });
     if (sec.status !== 0) throw new Error(`wrangler secret put failed:\n${sec.stderr}`);
 
-    saveConfig({ url, token });
-    console.log(`\nDone. Worker: ${url}\nThis machine is configured. On every other machine run:\n\n  agent-rooms setup --url ${url} --token ${token}\n\nKeep the token private: anyone with it can join your rooms.`);
+    saveServer({ name, url, token, provider: "cloudflare", cloudflare: { worker } });
+    if (flags.default) setDefaultServer(name);
+    console.log(`\nDone. Server "${name}" → ${url}${defaultServerName() === name ? " (default)" : ""}`);
+    console.log(`On every other machine run:\n\n  agent-rooms server add ${name} --url ${url} --token ${token}\n\nKeep the token private: anyone with it can join rooms on this server.`);
   },
 
   async doctor({ flags }) {
     const ok = (b) => (b ? "ok  " : "FAIL");
     const major = Number(process.versions.node.split(".")[0]);
     console.log(`${ok(major >= 22)} node ${process.versions.node} (need 22+)`);
-    const config = loadConfig();
-    console.log(`${ok(!!config.url)} worker url: ${config.url || "(not set: agent-rooms setup/deploy)"}`);
-    console.log(`${config.token ? "ok  " : "warn"} token: ${config.token ? "set" : "not set"}`);
-    if (config.url) {
+    const servers = listServers();
+    if (!servers.length) console.log(`FAIL ${NOT_CONFIGURED}`);
+    const def = defaultServerName();
+    for (const s of servers) {
+      const label = `server ${s.name}${s.name === def ? " (default)" : ""} ${s.url}`;
       try {
-        const health = await fetch(`${config.url}/health`).then((r) => r.json());
-        console.log(`${ok(health.ok)} worker reachable (protocol v${health.protocol ?? "?"})`);
-        const auth = await fetch(`${config.url}/rooms`, { headers: config.token ? { Authorization: `Bearer ${config.token}` } : {} });
-        console.log(`${ok(auth.ok)} token accepted (HTTP ${auth.status})`);
+        const health = await fetch(`${s.url}/health`).then((r) => r.json());
+        const auth = await fetch(`${s.url}/rooms`, { headers: authHeaders(s) });
+        console.log(`${ok(health.ok && auth.ok)} ${label}: reachable, protocol v${health.protocol ?? "?"}, token ${auth.ok ? "accepted" : `rejected (HTTP ${auth.status})`}`);
       } catch (e) {
-        console.log(`FAIL worker unreachable: ${e.message}`);
+        console.log(`FAIL ${label}: unreachable (${e.message})`);
       }
     }
+    if (servers.length > 1 && !def) console.log("warn no default server: bare room names won't resolve (agent-rooms server default <name>)");
     console.log(`ok   identity fingerprint ${fingerprint(loadIdentity().publicKey)}`);
     const session = resolveSession(flags.session);
-    if (!session) {
-      console.log("info not inside a Claude Code session (commands act as your human identity)");
-      return;
-    }
-    const status = session.status;
+    if (!session) return console.log("info not inside a Claude Code session (commands act as your human identity)");
     console.log(`ok   session ${session.key} (project ${session.meta.project})`);
-    console.log(`${ok(session.daemonAlive() || !Object.keys(session.rooms).length)} daemon ${session.daemonAlive() ? `running (pid ${session.readPid("daemon.pid")})` : "not running"}`);
-    for (const [room, s] of Object.entries(status?.rooms || {})) {
-      console.log(`${ok(s.connected)} room ${room} as @${s.handle || "?"}${s.error ? ` (${s.error})` : ""}`);
+    const hasRooms = Object.keys(session.rooms).length > 0;
+    console.log(`${ok(session.daemonAlive() || !hasRooms)} daemon ${session.daemonAlive() ? `running (pid ${session.readPid("daemon.pid")})` : "not running"}`);
+    for (const [key, s] of Object.entries(session.status?.rooms || {})) {
+      console.log(`${ok(s.connected)} room ${key} as @${s.handle || "?"}${s.error ? ` (${s.error})` : ""}`);
     }
   },
 
-  async rooms() {
-    const config = requireConfig();
-    const res = await fetch(`${config.url}/rooms`, { headers: config.token ? { Authorization: `Bearer ${config.token}` } : {} });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const { rooms } = await res.json();
-    const names = Object.keys(rooms).sort();
-    console.log(names.length ? names.map((n) => `${n}  (created ${new Date(rooms[n].createdAt).toISOString().slice(0, 10)})`).join("\n") : "No rooms yet.");
+  async rooms({ flags }) {
+    const servers = typeof flags.server === "string" ? [getServer(flags.server)].filter(Boolean) : listServers();
+    if (!servers.length) throw new Error(typeof flags.server === "string" ? `unknown server "${flags.server}"` : NOT_CONFIGURED);
+    for (const s of servers) {
+      const res = await fetch(`${s.url}/rooms`, { headers: authHeaders(s) });
+      if (!res.ok) {
+        console.log(`${s.name}: HTTP ${res.status}`);
+        continue;
+      }
+      const names = Object.keys((await res.json()).rooms).sort();
+      console.log(names.length ? names.map((n) => `${s.name}/${n}`).join("\n") : `${s.name}: no rooms yet`);
+    }
   },
 
   async whoami({ flags }) {
@@ -202,96 +286,88 @@ const commands = {
     console.log(`agent: ${session.key}${session.meta?.human ? " (human)" : ""}`);
     console.log(`fingerprint: ${fingerprint(loadIdentity().publicKey)}`);
     const rooms = Object.entries(session.rooms);
-    console.log(rooms.length ? rooms.map(([r, v]) => `room ${r} as @${v.handle || "?"}`).join("\n") : "not in any rooms");
+    console.log(rooms.length ? rooms.map(([key, v]) => `${key} as @${v.handle || "?"}`).join("\n") : "not in any rooms");
   },
 
   async join({ positional, flags }) {
-    const room = normalizeRoom(need(positional[0], 'join <room> [--intro "..."] [--handle name]'));
+    const target = parseRoomRef(need(positional[0], 'join <[server/]room> [--intro "..."] [--handle name]'));
     const session = currentSession(flags);
     const intro = typeof flags.intro === "string" ? flags.intro : "";
     const handle = typeof flags.handle === "string" ? flags.handle : "";
-    const welcome = await withRoom(session, room, async (conn) => conn.welcome, { intro, handle });
-    session.updateRoom(room, { handle: welcome.you.handle, ...(intro ? { intro } : {}) });
+    const welcome = await withRoom(session, target, async (conn) => conn.welcome, { intro, handle });
+    session.updateRoom(target.key, { server: target.server.name, room: target.room, handle: welcome.you.handle, ...(intro ? { intro } : {}) });
 
     const meta = session.meta;
-    if (!meta.human && !flags["no-remember"]) {
-      const project = loadProjectConfig(meta.project);
-      saveProjectConfig({ rooms: [...new Set([...project.rooms, room])] }, meta.project);
-    }
+    if (!meta.human && !flags["no-remember"]) rememberProjectRoom(meta.project, target.server, target.room);
     if (!meta.human) ensureDaemon(session);
 
-    console.log(`Joined "${room}" as @${welcome.you.handle}.`);
+    console.log(`Joined ${target.key} as @${welcome.you.handle}.`);
     console.log("Members:");
     for (const m of welcome.members) console.log(memberLine(m, session.key));
     if (meta.human) console.log('\nYou joined as a human. Run "agent-rooms listen" to receive messages here.');
   },
 
   async leave({ positional, flags }) {
-    const room = normalizeRoom(need(positional[0], "leave <room>"));
     const session = currentSession(flags);
-    await withRoom(session, room, (conn) => conn.request({ type: "leave" }).catch(() => {}));
-    session.updateRoom(room, null);
+    const target = joinedTarget(session, need(positional[0], "leave <room>"));
+    await withRoom(session, target, (conn) => conn.request({ type: "leave" }).catch(() => {}));
+    session.updateRoom(target.key, null);
     const meta = session.meta;
-    if (!meta.human && !flags.keep) {
-      const project = loadProjectConfig(meta.project);
-      saveProjectConfig({ rooms: project.rooms.filter((r) => r !== room) }, meta.project);
-    }
-    console.log(`Left "${room}".`);
+    if (!meta.human && !flags.keep) forgetProjectRoom(meta.project, target.server, target.room);
+    console.log(`Left ${target.key}.`);
   },
 
   async status({ positional, flags }) {
     const session = currentSession(flags);
-    const rooms = positional[0] ? [normalizeRoom(positional[0])] : Object.keys(session.rooms);
-    if (!rooms.length) return console.log('Not in any rooms. Join one: agent-rooms join <room> --intro "what you are working on"');
+    const keys = positional[0] ? [joinedTarget(session, positional[0]).key] : Object.keys(session.rooms);
+    if (!keys.length) return console.log('Not in any rooms. Join one: agent-rooms join <room> --intro "what you are working on"');
     const daemon = session.status?.rooms || {};
-    for (const room of rooms) {
-      requireJoined(session, room);
-      const { members } = await withRoom(session, room, (conn) => conn.request({ type: "who" }));
-      const d = daemon[room];
-      const live = session.meta.human ? "" : d?.connected ? " · receiving" : " · NOT receiving (daemon offline; agent-rooms doctor)";
-      console.log(`Room "${room}" · you are @${session.rooms[room].handle}${live}`);
+    for (const key of keys) {
+      const target = parseRoomRef(key);
+      const { members } = await withRoom(session, target, (conn) => conn.request({ type: "who" }));
+      const d = daemon[key];
+      const live = session.meta.human ? "" : d?.connected ? " · receiving" : ` · NOT receiving (${d?.error || "daemon offline"}; agent-rooms doctor)`;
+      console.log(`Room ${key} · you are @${session.rooms[key].handle}${live}`);
       for (const m of members) console.log(memberLine(m, session.key));
     }
   },
 
   async send({ positional, flags }) {
-    const room = normalizeRoom(need(positional[0], "send <room> <message>"));
-    const message = need(positional.slice(1).join(" "), 'send <room> "<@handle message>"');
     const session = currentSession(flags);
-    requireJoined(session, room);
+    const target = joinedTarget(session, need(positional[0], "send <room> <message>"));
+    const message = need(positional.slice(1).join(" "), 'send <room> "<@handle message>"');
     let context = "";
     if (flags["context-file"]) context = fs.readFileSync(String(flags["context-file"]), "utf8");
     else if (flags.context === "-") context = await readAllStdin();
     else if (typeof flags.context === "string") context = flags.context;
     const replyTo = flags["reply-to"] ? Number(flags["reply-to"]) : null;
 
-    const res = await withRoom(session, room, (conn) => conn.request({ type: "send", text: message, context, replyTo }));
-    console.log(`Sent #${res.seq} to "${room}".`);
+    const res = await withRoom(session, target, (conn) => conn.request({ type: "send", text: message, context, replyTo }));
+    console.log(`Sent #${res.seq} to ${target.key}.`);
     console.log(res.delivered.length ? `Notified: ${res.delivered.map((h) => "@" + h).join(", ")}` : "Nobody was notified: mention @handle or @all.");
     if (res.unknown.length) console.log(`Unknown handles: ${res.unknown.map((h) => "@" + h).join(", ")} (see agent-rooms status)`);
   },
 
   async "share-file"({ positional, flags }) {
-    const room = normalizeRoom(need(positional[0], "share-file <room> <path> <message>"));
-    const file = path.resolve(need(positional[1], "share-file <room> <path> <message>"));
-    const message = need(positional.slice(2).join(" "), 'share-file <room> <path> "@handle what it is"');
+    const usage = 'share-file <room> <path> "@handle what it is"';
     const session = currentSession(flags);
-    requireJoined(session, room);
+    const target = joinedTarget(session, need(positional[0], usage));
+    const file = path.resolve(need(positional[1], usage));
+    const message = need(positional.slice(2).join(" "), usage);
     const stat = fs.statSync(file);
     if (!stat.isFile()) throw new Error(`${file} is not a file`);
     if (stat.size > MAX_FILE_BYTES) throw new Error(`file is ${stat.size} bytes; max is ${MAX_FILE_BYTES}`);
-    const r = await withRoom(session, room, (conn) => shareAttachment(conn, session.key, message, fs.readFileSync(file), { name: path.basename(file), secret: false }));
-    console.log(`Shared ${path.basename(file)} (${stat.size} bytes, end-to-end encrypted) as #${r.seq} with ${r.recipients.map((h) => "@" + h).join(", ")}.`);
+    const r = await withRoom(session, target, (conn) => shareAttachment(conn, session.key, message, fs.readFileSync(file), { name: path.basename(file), secret: false }));
+    console.log(`Shared ${path.basename(file)} (${stat.size} bytes, end-to-end encrypted) as #${r.seq} in ${target.key} with ${r.recipients.map((h) => "@" + h).join(", ")}.`);
     if (r.skipped.length) console.log(`Skipped (no encryption key): ${r.skipped.join(", ")}`);
   },
 
   async "share-secret"({ positional, flags }) {
     const usage = "share-secret <room> <NAME> <message> (--env VAR | --file path)";
-    const room = normalizeRoom(need(positional[0], usage));
+    const session = currentSession(flags);
+    const target = joinedTarget(session, need(positional[0], usage));
     const name = need(positional[1], usage);
     const message = need(positional.slice(2).join(" "), usage);
-    const session = currentSession(flags);
-    requireJoined(session, room);
     let value;
     if (typeof flags.env === "string") {
       value = process.env[flags.env];
@@ -299,28 +375,30 @@ const commands = {
     } else if (typeof flags.file === "string") {
       value = fs.readFileSync(flags.file, "utf8");
     } else {
-      throw new Error(`${usage}\nSecrets are read from an env var or file so the value never appears in a conversation.`);
+      throw new Error(`usage: agent-rooms ${usage}\nSecrets are read from an env var or file so the value never appears in a conversation.`);
     }
     const payload = Buffer.from(JSON.stringify({ name, value }));
-    const r = await withRoom(session, room, (conn) => shareAttachment(conn, session.key, message, payload, { name, secret: true }));
-    console.log(`Shared secret ${name} (end-to-end encrypted) as #${r.seq} with ${r.recipients.map((h) => "@" + h).join(", ")}.`);
+    const r = await withRoom(session, target, (conn) => shareAttachment(conn, session.key, message, payload, { name, secret: true }));
+    console.log(`Shared secret ${name} (end-to-end encrypted) as #${r.seq} in ${target.key} with ${r.recipients.map((h) => "@" + h).join(", ")}.`);
     if (r.skipped.length) console.log(`Skipped (no encryption key): ${r.skipped.join(", ")}`);
   },
 
   async inbox({ positional, flags }) {
     const session = currentSession(flags);
     let entries = flags.unread ? session.unsurfaced() : session.readInbox();
-    if (positional[0]) entries = entries.filter((e) => e.room === normalizeRoom(positional[0]));
+    if (positional[0]) {
+      const key = joinedTarget(session, positional[0]).key;
+      entries = entries.filter((e) => `${e.server}/${e.room}` === key);
+    }
     entries = entries.slice(-(Number(flags.limit) || 20));
     session.markSurfaced(entries);
     console.log(entries.length ? entries.map((e) => formatEntry(e, { full: true })).join("\n") : "Inbox is empty.");
   },
 
   async history({ positional, flags }) {
-    const room = normalizeRoom(need(positional[0], "history <room>"));
     const session = currentSession(flags);
-    requireJoined(session, room);
-    const { messages } = await withRoom(session, room, (conn) => conn.request({ type: "history", limit: Math.min(Number(flags.limit) || 20, 50) }));
+    const target = joinedTarget(session, need(positional[0], "history <room>"));
+    const { messages } = await withRoom(session, target, (conn) => conn.request({ type: "history", limit: Math.min(Number(flags.limit) || 20, 50) }));
     if (!messages.length) return console.log("No messages yet.");
     for (const m of messages) {
       const to = m.kind === "all" ? "@all" : m.kind === "intro" ? "(intro)" : m.to?.length ? m.to.map((h) => "@" + h).join(" ") : "(nobody)";
@@ -331,20 +409,15 @@ const commands = {
   },
 
   async listen({ positional, flags }) {
-    const config = requireConfig();
     const session = currentSession(flags);
-    const rooms = positional.length ? positional.map(normalizeRoom) : Object.keys(session.rooms);
-    if (!rooms.length) throw new Error("join a room first: agent-rooms join <room>");
+    const targets = positional.length ? positional.map((r) => joinedTarget(session, r)) : Object.keys(session.rooms).map((k) => parseRoomRef(k));
+    if (!targets.length) throw new Error("join a room first: agent-rooms join <room>");
     const seen = new Set(session.readInbox().map(entryKey));
     const projectDir = session.meta.project || process.cwd();
-    for (const room of rooms) {
-      new RoomConnection({
-        url: config.url,
-        token: config.token,
-        room,
-        agentId: session.key,
-        profile: profileFor(session, room),
+    for (const target of targets) {
+      connectionFor(target, session, profileFor(session, target.key), {
         onDeliver: async (conn, m) => {
+          m.server = target.server.name;
           if (seen.has(entryKey(m))) return;
           if (m.attachment) {
             try {
@@ -359,7 +432,7 @@ const commands = {
           session.markSurfaced([m]);
           console.log(formatEntry(m, { full: true }));
         },
-        onState: (conn) => console.error(`[${room}] ${conn.connected ? `online as @${conn.welcome.you.handle}` : "reconnecting…"}`),
+        onState: (conn) => console.error(`[${target.key}] ${conn.connected ? `online as @${conn.welcome.you.handle}` : "reconnecting…"}`),
       }).start();
     }
     await new Promise(() => {});

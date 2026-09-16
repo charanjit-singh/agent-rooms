@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { loadConfig, loadProjectConfig } from "./config.js";
+import { loadProjectConfig, serverByUrl } from "./config.js";
 import { formatForModel } from "./format.js";
 import { pidAlive, Session, writePidAlias } from "./store.js";
 
@@ -78,8 +78,16 @@ async function sessionStart() {
   writePidAlias(claudePid, session.key);
   fs.rmSync(session.file("stop"), { force: true });
 
+  // Project rooms are recorded by server URL; map them onto this machine's server names.
+  const missing = [];
   if (!fs.existsSync(session.file("rooms.json"))) {
-    session.writeRooms(Object.fromEntries(loadProjectConfig(project).rooms.map((r) => [r, {}])));
+    const seeded = {};
+    for (const { server: url, room } of loadProjectConfig(project).rooms) {
+      const server = serverByUrl(url);
+      if (server) seeded[`${server.name}/${room}`] = { server: server.name, room };
+      else missing.push(`${room} on ${url}`);
+    }
+    session.writeRooms(seeded);
   }
   if (process.env.CLAUDE_ENV_FILE) {
     try {
@@ -87,19 +95,20 @@ async function sessionStart() {
     } catch {}
   }
 
+  const note = missing.length
+    ? `agent-rooms: this project's rooms ${missing.join(", ")} can't be joined because no server with that URL is configured on this machine. The user can add it with: agent-rooms server add <name> --url <url> --token <token>`
+    : "";
   const rooms = Object.keys(session.rooms);
-  if (!rooms.length) return;
-  if (!loadConfig().url) {
-    return emit("SessionStart", `agent-rooms: this project auto-joins ${rooms.join(", ")} but the CLI isn't configured. Tell the user to run \`agent-rooms setup\` or \`agent-rooms deploy\`.`);
-  }
+  if (!rooms.length) return note && emit("SessionStart", note);
   ensureDaemon(session);
   const unread = session.unsurfaced();
   session.markSurfaced(unread);
   emit(
     "SessionStart",
     [
-      `agent-rooms: you are an agent in room(s) ${rooms.map((r) => `"${r}"${session.rooms[r].handle ? ` as @${session.rooms[r].handle}` : ""}`).join(", ")}. ` +
+      `agent-rooms: you are an agent in room(s) ${rooms.map((r) => `${r}${session.rooms[r].handle ? ` as @${session.rooms[r].handle}` : ""}`).join(", ")}. ` +
         `Other agents reach you via @mentions/@all; use the \`agent-rooms\` CLI (skill: agent-rooms:rooms) to reply, check \`agent-rooms status\`, or share files. Session: ${session.key}`,
+      note,
       unread.length ? formatForModel(unread) : "",
     ]
       .filter(Boolean)

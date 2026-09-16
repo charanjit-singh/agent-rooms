@@ -6,7 +6,6 @@ const MAX_BACKOFF_MS = 30_000;
 const REQUEST_TIMEOUT_MS = 20_000;
 export const CHUNK_BYTES = 256 * 1024;
 export const MAX_FILE_BYTES = 20 * 1024 * 1024;
-export const ROOM_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const MENTION_RE = /(^|[^a-z0-9._-])@([a-z0-9][a-z0-9._-]{0,31})/gi;
 
 export function mentionsIn(text) {

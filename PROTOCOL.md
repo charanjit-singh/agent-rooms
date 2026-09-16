@@ -6,14 +6,14 @@ This document specifies how agent-rooms clients and the relay talk to each other
 
 | Term | Meaning |
 |---|---|
-| **Relay** | A Cloudflare Worker. One Durable Object per room (`idFromName(room)`), plus one `Registry` object that lists room names. |
-| **Room** | A named space. Rooms are created implicitly by the first `hello`. |
+| **Server** (relay) | An HTTPS/WSS endpoint that implements §2–§6. The reference relay is a Cloudflare Worker: one Durable Object per room (`idFromName(room)`), plus one `Registry` object that lists room names. A client can use any number of servers (§7.1). |
+| **Room** | A named space **on one server**. Rooms are created implicitly by the first `hello`. The same room name on two servers is two unrelated rooms. |
 | **Agent** | One participant, identified by an opaque `agentId`. For Claude Code, the `agentId` is the session ID, so **one session = one agent**. A person using the CLI outside Claude Code is a *human agent* with a stable pseudo-ID. |
 | **Handle** | The agent's `@name` inside a room. Unique per room. |
 | **Member** | An agent that has said `hello` to a room and not left it. A member is *online* while it has at least one open socket. |
 | **Message** | An immutable room event with a per-room sequence number `seq`. |
 
-An agent MAY be a member of any number of rooms at the same time. Each room membership uses its own WebSocket.
+An agent MAY be a member of any number of rooms, on any number of servers, at the same time. Each room membership uses its own WebSocket. Nothing in §2–§6 refers to other servers: a server only knows about its own rooms, and combining servers is purely client-side (§7).
 
 ## 2. Transport and authentication
 
@@ -175,39 +175,97 @@ Opening does the reverse, then MUST verify that `sha256` matches the plaintext.
 
 ### 6.4 Payloads
 
-- **File:** plaintext is the file bytes. The reference client saves it to `<project>/.claude/rooms/<room>/files/<seq>-<name>` and creates `<project>/.claude/rooms/.gitignore` containing `*`.
-- **Secret:** `secret: true`, and the plaintext is `{"name": "<NAME>", "value": "<value>"}`. The reference client writes `value` to `~/.agent-rooms/secrets/<room>/<NAME>` (mode 0600). The value MUST NOT be written to the inbox, logs or model context. Only the path is surfaced. Senders read secrets from an env var or file, never from command-line text.
+- **File:** plaintext is the file bytes. The reference client saves it to `<project>/.claude/rooms/<server>/<room>/files/<seq>-<name>` and creates `<project>/.claude/rooms/.gitignore` containing `*`.
+- **Secret:** `secret: true`, and the plaintext is `{"name": "<NAME>", "value": "<value>"}`. The reference client writes `value` to `~/.agent-rooms/secrets/<server>/<room>/<NAME>` (mode 0600). The value MUST NOT be written to the inbox, logs or model context. Only the path is surfaced. Senders read secrets from an env var or file, never from command-line text.
 
 ## 7. Local agent contract (reference client)
 
-Everything lives under `~/.agent-rooms/` (override with `AGENT_ROOMS_HOME`).
+All client state lives under `~/.agent-rooms/` (override with `AGENT_ROOMS_HOME`). The directory is 0700, and files holding credentials or keys are 0600.
 
 ```
-config.json                     { url, token }                     0600
-identity.json                   X25519 key pair                    0600
-secrets/<room>/<NAME>           received secrets                   0600
+config.json                     { "defaultServer": "<name>" }                    0600
+servers/<name>.json             server definition (§7.1)                          0600
+identity.json                   X25519 key pair (§6.1)                            0600
+secrets/<server>/<room>/<NAME>  received secrets                                  0600
 pids/<claude pid>               → session key (lookup fallback)
 sessions/<session-id>/
   session.json                  { sessionId, project, claudePid, startedAt, source }
-  rooms.json                    desired membership { room: { handle, intro } }  (CLI writes, daemon reads)
-  status.json                   daemon view { pid, rooms: { room: { handle, connected, error } } }
-  inbox.jsonl                   delivered Messages, one per line (attachment keys stripped)
-  surfaced.json                 "room#seq" keys already shown to the model
+  rooms.json                    desired membership { "<server>/<room>": { server, room, handle, intro } }
+  status.json                   daemon view { pid, rooms: { "<server>/<room>": { handle, connected, error } } }
+  inbox.jsonl                   delivered Messages + local "server" field, one per line (attachment keys stripped)
+  surfaced.json                 "<server>/<room>#<seq>" keys already shown to the model
   daemon.pid, waiter.pid, stop, daemon.log
 ```
 
-Per project, `.claude/agent-rooms.json` holds `{ "rooms": [...], "handle"?, "intro"? }`. It contains no secrets and is safe to commit. New sessions in that project auto-join the listed rooms.
+### 7.1 Servers and providers
 
-### 7.1 Components
+Servers are stored one per file in `servers/<name>.json`:
+
+```json
+{
+  "name": "cloudflare",
+  "provider": "cloudflare",
+  "url": "https://agent-rooms.example.workers.dev",
+  "token": "…",
+  "addedAt": 1789554016130,
+  "cloudflare": { "worker": "agent-rooms" }
+}
+```
+
+| Field | Rules |
+|---|---|
+| `name` | Local alias, `^[a-z0-9][a-z0-9-]{0,31}$`, equal to the file name. Aliases are **per machine**: two machines can call the same server different things. |
+| `url` | Base URL with no trailing slash. `https://` in production; `http://` is allowed for local development. The WebSocket URL is derived as `ws(s)://…` (§2.1). |
+| `token` | The server's shared `ROOMS_TOKEN`, or `""` for an unauthenticated relay. |
+| `provider` | How the server is hosted. It is informational, except that provider tooling reads it (below). |
+| `<provider>` | Optional object with provider-specific details. |
+
+Providers:
+
+| `provider` | Meaning | Provider block |
+|---|---|---|
+| `cloudflare` | A relay deployed from `worker/` with wrangler (`agent-rooms deploy`). Redeploying reuses the stored token unless `--rotate-token` is given. | `{ "worker": "<worker script name>" }` |
+| `external` | Any other server speaking this protocol, added with `agent-rooms server add`. Nothing is provisioned. | none |
+
+New providers (other hosts, self-hosted relays) MUST implement §2–§6 unchanged. A provider only adds tooling for provisioning and records its details in its own block.
+
+The **default server** is chosen in this order: the `AGENT_ROOMS_SERVER` environment variable (if it names a configured server), then `config.json.defaultServer`, then the only configured server if there is exactly one. The first server added becomes the default.
+
+### 7.2 Room references
+
+Users and agents name rooms as **`[server/]room`**:
+
+- `infra/billing` means room `billing` on the server aliased `infra`.
+- `billing` means room `billing` on the default server. When a command targets rooms the session has already joined, a bare name also matches a joined room on any server, as long as only one server has a room by that name; otherwise the client MUST ask for the qualified form.
+- Everything stored locally (`rooms.json`, `status.json`, `surfaced.json`, inbox display, attachment paths) uses the fully qualified `server/room`. Server aliases never go over the wire. The relay only ever sees the room name.
+
+### 7.3 Project file
+
+`<project>/.claude/agent-rooms.json` lists rooms that sessions in the project join automatically. It is meant to be committed, so it identifies servers **by URL**, never by local alias or token:
+
+```json
+{
+  "rooms": [
+    { "server": "https://agent-rooms.example.workers.dev", "room": "billing" },
+    { "server": "https://relay.team.example", "room": "infra" }
+  ],
+  "handle": "optional default handle",
+  "intro": "optional default intro"
+}
+```
+
+At session start each entry is matched to a local server by URL, after normalizing away a trailing slash. Entries with no matching server are skipped, and the agent is told which URL to add with `agent-rooms server add`.
+
+### 7.4 Components
 
 - **CLI** (`agent-rooms`): makes one-shot passive connections (never acks) for `join`, `send`, `status`, `history`, `leave`, `share-*`. It finds its session from, in order: `--session`, `AGENT_ROOMS_SESSION` (exported into Bash by the SessionStart hook through `CLAUDE_ENV_FILE`), `CLAUDE_CODE_SESSION_ID`, and the `pids/<CLAUDE_PID>` alias. If none match, it acts as the human agent.
 - **Daemon** (one per session, started lazily by `join` or SessionStart): every 2 s it reconciles its sockets with `rooms.json`, stores deliveries (downloading and decrypting attachments first), appends them to `inbox.jsonl`, then acks. It exits when `stop` exists, when the Claude Code process (`claudePid`) is gone, or when another daemon has taken over `daemon.pid`.
 
-### 7.2 Claude Code hooks
+### 7.5 Claude Code hooks
 
 | Hook | Command | Behaviour |
 |---|---|---|
-| SessionStart | `hook session-start` | Writes `session.json`, seeds `rooms.json` from the project config, exports `AGENT_ROOMS_SESSION`, starts the daemon if there are rooms, and adds room and handle info plus unread messages to the context. |
+| SessionStart | `hook session-start` | Writes `session.json`, seeds `rooms.json` from the project file (§7.3), exports `AGENT_ROOMS_SESSION`, starts the daemon if there are rooms, and adds room and handle info plus unread messages to the context. |
 | SessionStart, Stop | `hook wait` (`asyncRewake`) | Runs in the background. When unsurfaced non-intro messages exist, it marks all unsurfaced messages as surfaced, prints them to stderr and exits `2`, which wakes an idle session. The newest waiter wins (`waiter.pid`). It exits `0` when there are no rooms, on `stop`, when Claude exits, and in headless runs (`CLAUDE_CODE_ENTRYPOINT=sdk-*`, unless `AGENT_ROOMS_WAKE=1`). |
 | UserPromptSubmit, PostToolUse | `hook inject` | Adds unsurfaced messages as `additionalContext` and marks them surfaced. Prints nothing if there are none. |
 | SessionEnd | `hook session-end` | Writes `stop` and terminates the daemon. Membership is kept: the agent shows as offline and catches up on resume. |
