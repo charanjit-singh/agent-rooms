@@ -1,0 +1,71 @@
+.claude-plugin/marketplace.json
+  s_2f0e13af7049d9::t_acae4577111d6f 1-15
+bin/agent-rooms
+  s_2f0e13af7049d9::t_5eae2e3d79bdb8 1-4
+skills/setup/SKILL.md
+  s_2f0e13af7049d9::t_4be84598ec5713 1-51
+src/cli.js
+  s_2f0e13af7049d9::t_4569694292bd40 1-399
+worker/package-lock.json
+  s_2f0e13af7049d9::t_57957617bb771f 1-1592
+worker/src/index.js
+  s_2f0e13af7049d9::t_5fd208df57acd4 1-49
+worker/src/room.js
+  s_2f0e13af7049d9::t_3802fb401445df 1-359
+.claude-plugin/plugin.json
+  s_2f0e13af7049d9::t_1d19ee67eebb61 1-7
+.gitignore
+  s_2f0e13af7049d9::t_a7dc45fc6ba9b5 1-6
+LICENSE
+  s_2f0e13af7049d9::t_6b523ec4702f4a 1-21
+PROTOCOL.md
+  s_2f0e13af7049d9::t_8d0ae8d6502865 1-232
+README.md
+  s_2f0e13af7049d9::t_8d9581641d1b17 1-165
+bin/agent-rooms.cmd
+  s_2f0e13af7049d9::t_c6317332f4a073 1-2
+hooks/hooks.json
+  s_2f0e13af7049d9::t_0a773b203cdd39 1-41
+package.json
+  s_2f0e13af7049d9::t_a9d2cbfcbe51c0 1-30
+skills/rooms/SKILL.md
+  s_2f0e13af7049d9::t_bbd8c648139468 1-56
+src/agent.js
+  s_2f0e13af7049d9::t_4346776414b487 1-124
+src/client.js
+  s_2f0e13af7049d9::t_f512a3478da6fc 1-164
+src/config.js
+  s_2f0e13af7049d9::t_79f414a6dcc078 1-67
+src/crypto.js
+  s_2f0e13af7049d9::t_bb48e2938a74cf 1-78
+src/daemon.js
+  s_2f0e13af7049d9::t_6161fedf90385a 1-104
+src/format.js
+  s_2f0e13af7049d9::t_357d6ebca486de 1-42
+src/hooks.js
+  s_2f0e13af7049d9::t_6883ba54fb0bc7 1-193
+src/store.js
+  s_2f0e13af7049d9::t_0f1a6b14d88e5c 1-177
+worker/package.json
+  s_2f0e13af7049d9::t_523bd7aacc516f 1-12
+worker/src/registry.js
+  s_2f0e13af7049d9::t_0c84ebb56b2dc6 1-35
+worker/wrangler.toml
+  s_2f0e13af7049d9::t_9625bcf19e4926 1-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "97002f41baa05f430600f89f86ced23a164a67fd",
+  "prompts": {},
+  "sessions": {
+    "s_2f0e13af7049d9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d1deb1a1-41e1-42d3-bb4a-ab4d3df182f4",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Charanjit Singh <charanjitdotsingh@gmail.com>"
+    }
+  }
+}
