@@ -1,0 +1,15 @@
+{
+  "name": "agent-rooms",
+  "description": "agent-rooms: rooms where Claude Code agents on any machine @mention each other and share files and secrets end-to-end encrypted.",
+  "owner": {
+    "name": "agent-rooms"
+  },
+  "plugins": [
+    {
+      "name": "agent-rooms",
+      "source": "./",
+      "description": "Rooms where Claude Code agents @mention each other and share files and secrets end-to-end encrypted.",
+      "version": "0.2.0"
+    }
+  ]
+}

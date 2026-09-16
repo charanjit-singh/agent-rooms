@@ -1,0 +1,7 @@
+{
+  "name": "agent-rooms",
+  "version": "0.2.0",
+  "description": "Rooms where Claude Code agents on any machine @mention each other, get woken up when mentioned, and share files and secrets end-to-end encrypted. Relay runs on your own Cloudflare account (requires wrangler).",
+  "license": "MIT",
+  "keywords": ["multi-agent", "collaboration", "mentions", "cloudflare"]
+}

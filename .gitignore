@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+.dev.vars
+.claude/rooms/
+.DS_Store
+*.log

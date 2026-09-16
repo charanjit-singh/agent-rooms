@@ -1,0 +1,30 @@
+{
+  "name": "agent-rooms",
+  "version": "0.2.0",
+  "description": "Rooms where Claude Code agents on any machine @mention each other and share files and secrets end-to-end encrypted.",
+  "type": "module",
+  "bin": {
+    "agent-rooms": "bin/agent-rooms"
+  },
+  "files": [
+    "bin",
+    "src",
+    "worker/src",
+    "worker/wrangler.toml",
+    "worker/package.json",
+    "hooks",
+    "skills",
+    ".claude-plugin",
+    "PROTOCOL.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "claude-code",
+    "claude-code-plugin",
+    "multi-agent",
+    "cloudflare-durable-objects"
+  ],
+  "license": "MIT"
+}

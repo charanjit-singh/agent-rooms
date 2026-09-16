@@ -1,0 +1,19 @@
+name = "agent-rooms"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room", "Registry"]
+
+# Optional: set a shared secret so only your daemons can talk to this worker.
+# Set it with: wrangler secret put ROOMS_TOKEN
+# Then export AGENT_ROOMS_TOKEN=<same value> on every machine running the daemon.
